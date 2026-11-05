@@ -1,0 +1,7 @@
+{
+  "idle_timeout_seconds": 900,
+  "check_interval_seconds": 60,
+  "dry_run": true,
+  "kill_grace_seconds": 10,
+  "duration_seconds": 0
+}

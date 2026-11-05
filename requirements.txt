@@ -1,2 +1,2 @@
-# Install this project; runtime dependencies are declared in pyproject.toml.
-.
+nvidia-ml-py>=12
+psutil>=5.9

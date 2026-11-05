@@ -6,6 +6,7 @@ from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 import unittest
+import unittest.mock
 from unittest.mock import patch
 
 import gpu_idle_guard as guard
@@ -97,7 +98,8 @@ class CollectorTests(unittest.TestCase):
         process = SimpleNamespace(pid=os.getpid(), usedGpuMemory=2*1024**3)
         with tempfile.TemporaryDirectory() as directory:
             args = SimpleNamespace(idle_timeout_seconds=.001, duration_seconds=.02,
-                                   interval_seconds=.005, snapshot_interval_seconds=.005,
+                                   interval_seconds=.005, check_interval_seconds=.005,
+                                   dry_run=True, kill_grace_seconds=10,
                                    process_list_interval_seconds=list_interval,
                                    activity_threshold_percent=1,
                                    output=str(Path(directory)/'report.json'),
@@ -151,6 +153,61 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(row['started_timestamp'], 1)
         self.assertEqual(row['executable'], '/test/python')
         self.assertTrue(all(g['memory_observed_at'] for g in row['gpus']))
+
+
+class ActTests(unittest.TestCase):
+    ROW = dict(pid=42, started_timestamp=5.0, username='u', name='py',
+               seconds_without_observed_activity=1000, would_reclaim=True)
+
+    def args(self, dry_run):
+        return SimpleNamespace(dry_run=dry_run, kill_grace_seconds=10)
+
+    def test_dry_run_never_touches_process(self):
+        with patch.object(guard.psutil, 'Process') as proc, contextlib.redirect_stdout(io.StringIO()):
+            actions = guard.act([self.ROW], self.args(True), {}, 0)
+        proc.assert_not_called()
+        self.assertEqual(actions[0]['action'], 'would_terminate')
+
+    def test_not_candidate_is_ignored(self):
+        row = dict(self.ROW, would_reclaim=False)
+        self.assertEqual(guard.act([row], self.args(False), {}, 0), [])
+
+    def test_sigterm_then_sigkill_after_grace(self):
+        process = SimpleNamespace(create_time=lambda: 5.0, terminate=unittest.mock.Mock(),
+                                  kill=unittest.mock.Mock())
+        terminated = {}
+        with patch.object(guard.psutil, 'Process', return_value=process), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(guard.act([self.ROW], self.args(False), terminated, 0)[0]['action'], 'sigterm')
+            self.assertEqual(guard.act([self.ROW], self.args(False), terminated, 5)[0]['action'],
+                             'waiting_after_sigterm')
+            self.assertEqual(guard.act([self.ROW], self.args(False), terminated, 10)[0]['action'], 'sigkill')
+        process.terminate.assert_called_once()
+        process.kill.assert_called_once()
+
+    def test_reused_pid_is_not_signalled(self):
+        process = SimpleNamespace(create_time=lambda: 99.0, terminate=unittest.mock.Mock())
+        with patch.object(guard.psutil, 'Process', return_value=process), \
+                contextlib.redirect_stdout(io.StringIO()):
+            actions = guard.act([self.ROW], self.args(False), {}, 0)
+        process.terminate.assert_not_called()
+        self.assertEqual(actions[0]['action'], 'already_gone')
+
+
+class ConfigTests(unittest.TestCase):
+    def test_unknown_key_rejected_and_values_loaded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)/'c.json'
+            path.write_text('{"check_interval_seconds": 30, "dry_run": false}')
+            self.assertEqual(guard.load_config(path), dict(check_interval_seconds=30, dry_run=False))
+            path.write_text('{"typo": 1}')
+            with self.assertRaises(ValueError):
+                guard.load_config(path)
+
+    def test_defaults_are_dry_run_every_minute(self):
+        self.assertTrue(guard.DEFAULTS['dry_run'])
+        self.assertEqual(guard.DEFAULTS['check_interval_seconds'], 60)
+        self.assertEqual(guard.DEFAULTS['duration_seconds'], 0)
 
 
 if __name__ == '__main__':

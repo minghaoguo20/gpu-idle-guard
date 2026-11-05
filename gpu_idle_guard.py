@@ -1,13 +1,36 @@
 #!/usr/bin/env python3
-"""Read-only GPU idle monitor. No process termination code is included."""
+"""GPU idle guard: long-running monitor that flags (dry-run) or terminates idle GPU processes."""
 import argparse
 import datetime as dt
 import json
 from pathlib import Path
+import sys
 import time
 
 import psutil
 import pynvml as nv
+
+
+DEFAULTS = dict(
+    idle_timeout_seconds=900,
+    duration_seconds=0,                # 0 = run forever
+    interval_seconds=1,                # activity sampling period
+    process_list_interval_seconds=5,
+    check_interval_seconds=60,         # how often idle processes are evaluated/reported
+    activity_threshold_percent=1,
+    dry_run=True,                      # True: only report, never terminate
+    kill_grace_seconds=10,             # SIGTERM -> SIGKILL delay
+    output='reports/gpu-observation.json',
+    markdown='reports/gpu-observation.md',
+)
+
+
+def load_config(path):
+    config = json.loads(Path(path).read_text(encoding='utf-8'))
+    unknown = set(config) - set(DEFAULTS)
+    if unknown:
+        raise ValueError('unknown config keys: ' + ', '.join(sorted(unknown)))
+    return config
 
 
 def iso(timestamp):
@@ -93,9 +116,10 @@ def duration(seconds):
 
 
 def markdown(report):
-    lines = ['# GPU 进程只读观察结果', '',
+    mode = 'dry-run，未终止任何进程' if report['dry_run'] else '已启用终止（SIGTERM，超时后 SIGKILL）'
+    lines = ['# GPU 进程观察结果', '',
              f"观察：{report['started_at']} 至 {report['finished_at']}（UTC）；"
-             f"阈值 {report['config']['idle_timeout_seconds']:g} 秒。未终止任何进程。", '',
+             f"阈值 {report['config']['idle_timeout_seconds']:g} 秒；{mode}。", '',
              '无样本表示未观察到活动，并非证明 GPU 完全没有执行。标记“≥”表示从监控开始就未见活动，历史未知；峰值“—”表示未返回样本。', '',
              '| GPU | PID | 用户 | 程序 | 显存 GiB | 启动时间 UTC | 距最近活动/未见活动时长 | 样本数 | 峰值 SM% | 判定 |',
              '|---|---:|---|---|---:|---|---|---:|---:|---|']
@@ -107,7 +131,7 @@ def markdown(report):
         quiet = duration(row['seconds_without_observed_activity'])
         if row['no_activity_seen_in_observation']:
             quiet = '≥' + quiet
-        verdict = '应回收（仅模拟）' if row['would_reclaim'] else '未到阈值'
+        verdict = ('应回收（dry-run）' if report['dry_run'] else '应回收') if row['would_reclaim'] else '未到阈值'
         if row['health_resets']:
             verdict += '；计时曾重置'
         values = [gpu, row['pid'], row['username'], row['name'], mem,
@@ -116,6 +140,46 @@ def markdown(report):
         lines.append('| ' + ' | '.join(str(v).replace('|', '\\|').replace('\n', ' ') for v in values) + ' |')
     lines += ['', '完整路径、各 GPU 显存、其他引擎活动、采样错误和资源开销见配套 JSON。', '']
     return '\n'.join(lines)
+
+
+def act(rows, args, terminated, now):
+    """Report idle candidates; terminate them unless dry_run. Never blocks the sampling loop."""
+    actions = []
+    live = {(row['pid'], row['started_timestamp']) for row in rows}
+    for key in [k for k in terminated if k not in live]:
+        del terminated[key]
+    for row in rows:
+        if not row['would_reclaim']:
+            continue
+        key = (row['pid'], row['started_timestamp'])
+        item = dict(pid=row['pid'], username=row['username'], name=row['name'],
+                    idle_seconds=row['seconds_without_observed_activity'])
+        if args.dry_run:
+            item['action'] = 'would_terminate'
+        else:
+            try:
+                process = psutil.Process(row['pid'])
+                # Guard against PID reuse: only signal the exact process we observed.
+                if abs(process.create_time() - row['started_timestamp']) > 1e-3:
+                    raise psutil.NoSuchProcess(row['pid'])
+                if key not in terminated:
+                    process.terminate()
+                    terminated[key] = now
+                    item['action'] = 'sigterm'
+                elif now - terminated[key] >= args.kill_grace_seconds:
+                    process.kill()
+                    item['action'] = 'sigkill'
+                else:
+                    item['action'] = 'waiting_after_sigterm'
+            except psutil.NoSuchProcess:
+                item['action'] = 'already_gone'
+            except (psutil.Error, OSError) as exc:
+                item.update(action='failed', error=str(exc))
+        actions.append(item)
+        print(f"[{iso(time.time())}] {'dry-run ' if args.dry_run else ''}{item['action']} "
+              f"pid={item['pid']} user={item['username']} name={item['name']} "
+              f"idle={duration(item['idle_seconds'])}", flush=True)
+    return actions
 
 
 def run(args):
@@ -133,7 +197,8 @@ def run(args):
         cycles, max_cycle, gap_resets, error_count = 0, 0, 0, 0
         previous_cycle = started
         clock_offset = wall_start-started
-        last_write = started - args.snapshot_interval_seconds
+        last_write = started - args.check_interval_seconds
+        terminated = {}
         own_process = psutil.Process()
 
         def error(gpu, operation, exc):
@@ -149,8 +214,11 @@ def run(args):
                 rows.append(dict(**state['info'], gpus=list(state['gpus'].values()),
                                  **state['activity'].summary(now, args.idle_timeout_seconds)))
             elapsed = now-started
+            actions = act(rows, args, terminated, now)
+            print(f"[{iso(time.time())}] check: {len(rows)} GPU processes, "
+                  f"{len(actions)} idle candidates (timeout {args.idle_timeout_seconds:g}s)", flush=True)
             report = dict(
-                read_only=True, started_at=iso(wall_start), finished_at=iso(time.time()),
+                dry_run=args.dry_run, actions=actions, started_at=iso(wall_start), finished_at=iso(time.time()),
                 config=vars(args), devices=devices, elapsed_seconds=round(elapsed, 2),
                 cycles=cycles, max_cycle_seconds=round(max_cycle, 3),
                 monitor_cpu_seconds=round(time.process_time()-cpu_start, 3),
@@ -158,7 +226,7 @@ def run(args):
                 monitor_rss_mib=round(own_process.memory_info().rss/1024**2, 2),
                 gap_resets=gap_resets, error_count=error_count, recent_errors=errors,
                 note='Only observed activity is known. No samples is not proof of zero work. '
-                     'A candidate is a policy simulation, not a termination decision.',
+                     'With dry_run a candidate is only a policy simulation.',
                 processes=sorted(rows, key=lambda r: (min(g['index'] for g in r['gpus']), r['pid'])),
             )
             if args.output:
@@ -259,36 +327,51 @@ def run(args):
             if cycle_elapsed > max(5, args.interval_seconds*3):
                 for state in states.values():
                     state['activity'].reset(time.monotonic())
-            done = time.monotonic()-started >= args.duration_seconds
-            if done or time.monotonic()-last_write >= args.snapshot_interval_seconds:
+            done = args.duration_seconds > 0 and time.monotonic()-started >= args.duration_seconds
+            if done or time.monotonic()-last_write >= args.check_interval_seconds:
                 report = publish()
                 last_write = time.monotonic()
             if done:
                 print(json.dumps({k: v for k, v in report.items() if k not in ('processes', 'recent_errors')}, ensure_ascii=False))
                 break
-            time.sleep(max(0, min(args.interval_seconds-(time.monotonic()-cycle_start),
-                                  args.duration_seconds-(time.monotonic()-started))))
+            wait = args.interval_seconds-(time.monotonic()-cycle_start)
+            if args.duration_seconds > 0:
+                wait = min(wait, args.duration_seconds-(time.monotonic()-started))
+            time.sleep(max(0, wait))
     finally:
         nv.nvmlShutdown()
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--idle-timeout-seconds', type=float, default=900)
-    parser.add_argument('--duration-seconds', type=float, default=910)
-    parser.add_argument('--interval-seconds', type=float, default=1)
-    parser.add_argument('--process-list-interval-seconds', type=float, default=5)
-    parser.add_argument('--snapshot-interval-seconds', type=float, default=30)
-    parser.add_argument('--activity-threshold-percent', type=int, default=1)
-    parser.add_argument('--output', default='reports/gpu-observation.json')
-    parser.add_argument('--markdown', default='reports/gpu-observation.md')
-    args = parser.parse_args()
-    if min(args.idle_timeout_seconds, args.duration_seconds, args.interval_seconds,
-           args.process_list_interval_seconds, args.snapshot_interval_seconds) <= 0:
-        parser.error('timeouts and intervals must be positive')
+    parser.add_argument('--config', help='JSON config file; command-line options override it')
+    for key, default in DEFAULTS.items():
+        flag = '--' + key.replace('_', '-')
+        if isinstance(default, bool):
+            parser.add_argument(flag, action=argparse.BooleanOptionalAction, default=argparse.SUPPRESS)
+        else:
+            parser.add_argument(flag, type=type(default), default=argparse.SUPPRESS)
+    cli = vars(parser.parse_args())
+    config_path = cli.pop('config')
+    values = dict(DEFAULTS)
+    try:
+        if config_path is not None:
+            values.update(load_config(config_path))
+    except (OSError, ValueError) as exc:
+        parser.error(f'bad config: {exc}')
+    values.update(cli)
+    args = argparse.Namespace(**values)
+    if not isinstance(args.dry_run, bool):
+        parser.error('dry_run must be true or false')
+    if min(args.idle_timeout_seconds, args.interval_seconds, args.process_list_interval_seconds,
+           args.check_interval_seconds) <= 0 or args.duration_seconds < 0 or args.kill_grace_seconds < 0:
+        parser.error('timeouts and intervals must be positive (duration 0 = run forever)')
     if not 1 <= args.activity_threshold_percent <= 100:
         parser.error('activity threshold must be between 1 and 100')
-    run(args)
+    try:
+        run(args)
+    except KeyboardInterrupt:
+        sys.exit(130)
 
 
 if __name__ == '__main__':
